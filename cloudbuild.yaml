@@ -1,0 +1,29 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-t'
+      - 'us-west2-docker.pkg.dev/omenz-open/cloud-run-source-deploy/omenz-backend:$COMMIT_SHA'
+      - '.'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-west2-docker.pkg.dev/omenz-open/cloud-run-source-deploy/omenz-backend:$COMMIT_SHA'
+
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'omenz-backend'
+      - '--image'
+      - 'us-west2-docker.pkg.dev/omenz-open/cloud-run-source-deploy/omenz-backend:$COMMIT_SHA'
+      - '--region'
+      - 'us-west2'
+      - '--platform'
+      - 'managed'
+      - '--allow-unauthenticated'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
