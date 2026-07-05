@@ -46,7 +46,7 @@ def test_env():
         "anthropic_key_loaded": bool(os.getenv("ANTHROPIC_API_KEY")),
         "perplexity_key_loaded": bool(os.getenv("PERPLEXITY_API_KEY")),
         "openai_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-        "anthropic_model": os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
+        "anthropic_model": os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6"),
         "perplexity_model": os.getenv("PERPLEXITY_MODEL", "sonar"),
     }
 
@@ -120,7 +120,7 @@ async def test_anthropic():
     start = time.time()
     run_id = event_id()
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    model = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
+    model = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6")
 
     if not api_key:
         return JSONResponse(
