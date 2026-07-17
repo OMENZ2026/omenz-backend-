@@ -7,6 +7,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
+from memory import memory_health
 from router import (
     ANTHROPIC,
     OPENAI,
@@ -16,18 +17,57 @@ from router import (
 )
 
 
-app = FastAPI(title="OMENZ Backend", version="0.3.2")
+# ==========================================================
+# OMENZ BACKEND v0.3.3
+# Router + provider execution + memory health integration
+# ==========================================================
+#
+# Preserved:
+# - Root and health endpoints
+# - Patreon callback
+# - Environment validation
+# - PENI / OpenAI execution
+# - AUDE / Anthropic execution
+# - XITY / Perplexity execution
+# - Router selection
+# - Provider validation endpoints
+# - run_id, latency, and token reporting
+#
+# Added:
+# - Memory module health reporting
+# - GET /memory/health
+#
+# Important:
+# - Memory remains in-process and temporary.
+# - Memory records reset when the Cloud Run instance restarts.
+# - No memory create, revise, archive, or search API routes yet.
+# - No agents, dashboards, or autonomous memory promotion.
+# ==========================================================
+
+
+BACKEND_VERSION = "0.3.3"
+
+app = FastAPI(
+    title="OMENZ Backend",
+    version=BACKEND_VERSION,
+)
 
 
 class RouteRequest(BaseModel):
     task_type: str = Field(
         ...,
-        description="Task category such as chat, code, reasoning, analysis, research, or search.",
+        description=(
+            "Task category such as chat, code, reasoning, "
+            "analysis, research, or search."
+        ),
     )
     message: str = Field(
         ...,
         min_length=1,
-        description="The user request that the selected provider should process.",
+        description=(
+            "The user request that the selected provider "
+            "should process."
+        ),
     )
 
 
@@ -44,7 +84,10 @@ def openai_usage(data):
 
     tokens_in = usage.get("prompt_tokens", 0) or 0
     tokens_out = usage.get("completion_tokens", 0) or 0
-    total_tokens = usage.get("total_tokens", tokens_in + tokens_out) or 0
+    total_tokens = usage.get(
+        "total_tokens",
+        tokens_in + tokens_out,
+    ) or 0
 
     return tokens_in, tokens_out, total_tokens
 
@@ -64,7 +107,10 @@ def perplexity_usage(data):
 
     tokens_in = usage.get("prompt_tokens", 0) or 0
     tokens_out = usage.get("completion_tokens", 0) or 0
-    total_tokens = usage.get("total_tokens", tokens_in + tokens_out) or 0
+    total_tokens = usage.get(
+        "total_tokens",
+        tokens_in + tokens_out,
+    ) or 0
 
     return tokens_in, tokens_out, total_tokens
 
@@ -99,7 +145,9 @@ async def call_openai(message, run_id, start):
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are PENI inside the OMENZ stack.",
+                            "content": (
+                                "You are PENI inside the OMENZ stack."
+                            ),
                         },
                         {
                             "role": "user",
@@ -115,7 +163,11 @@ async def call_openai(message, run_id, start):
         return {
             "provider": OPENAI,
             "provider_name": provider_name(OPENAI),
-            "status": "ok" if response.status_code == 200 else "error",
+            "status": (
+                "ok"
+                if response.status_code == 200
+                else "error"
+            ),
             "status_code": response.status_code,
             "model": model,
             "run_id": run_id,
@@ -123,10 +175,16 @@ async def call_openai(message, run_id, start):
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "total_tokens": total_tokens,
-            "reply": data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content"),
-            "raw": data if response.status_code != 200 else None,
+            "reply": (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+            ),
+            "raw": (
+                data
+                if response.status_code != 200
+                else None
+            ),
         }, response.status_code
 
     except Exception as error:
@@ -146,7 +204,10 @@ async def call_openai(message, run_id, start):
 
 async def call_anthropic(message, run_id, start):
     api_key = os.getenv("ANTHROPIC_API_KEY")
-    model = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-6")
+    model = os.getenv(
+        "ANTHROPIC_MODEL",
+        "claude-opus-4-6",
+    )
 
     if not api_key:
         return {
@@ -185,15 +246,25 @@ async def call_anthropic(message, run_id, start):
         data = response.json()
 
         text = None
-        if isinstance(data.get("content"), list) and data["content"]:
+
+        if (
+            isinstance(data.get("content"), list)
+            and data["content"]
+        ):
             text = data["content"][0].get("text")
 
-        tokens_in, tokens_out, total_tokens = anthropic_usage(data)
+        tokens_in, tokens_out, total_tokens = (
+            anthropic_usage(data)
+        )
 
         return {
             "provider": ANTHROPIC,
             "provider_name": provider_name(ANTHROPIC),
-            "status": "ok" if response.status_code == 200 else "error",
+            "status": (
+                "ok"
+                if response.status_code == 200
+                else "error"
+            ),
             "status_code": response.status_code,
             "model": model,
             "run_id": run_id,
@@ -202,7 +273,11 @@ async def call_anthropic(message, run_id, start):
             "tokens_out": tokens_out,
             "total_tokens": total_tokens,
             "reply": text,
-            "raw": data if response.status_code != 200 else None,
+            "raw": (
+                data
+                if response.status_code != 200
+                else None
+            ),
         }, response.status_code
 
     except Exception as error:
@@ -251,7 +326,9 @@ async def call_perplexity(message, run_id, start):
                     "messages": [
                         {
                             "role": "system",
-                            "content": "You are XITY inside the OMENZ stack.",
+                            "content": (
+                                "You are XITY inside the OMENZ stack."
+                            ),
                         },
                         {
                             "role": "user",
@@ -262,12 +339,18 @@ async def call_perplexity(message, run_id, start):
             )
 
         data = response.json()
-        tokens_in, tokens_out, total_tokens = perplexity_usage(data)
+        tokens_in, tokens_out, total_tokens = (
+            perplexity_usage(data)
+        )
 
         return {
             "provider": PERPLEXITY,
             "provider_name": provider_name(PERPLEXITY),
-            "status": "ok" if response.status_code == 200 else "error",
+            "status": (
+                "ok"
+                if response.status_code == 200
+                else "error"
+            ),
             "status_code": response.status_code,
             "model": model,
             "run_id": run_id,
@@ -275,10 +358,16 @@ async def call_perplexity(message, run_id, start):
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "total_tokens": total_tokens,
-            "reply": data.get("choices", [{}])[0]
-            .get("message", {})
-            .get("content"),
-            "raw": data if response.status_code != 200 else None,
+            "reply": (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content")
+            ),
+            "raw": (
+                data
+                if response.status_code != 200
+                else None
+            ),
         }, response.status_code
 
     except Exception as error:
@@ -296,15 +385,32 @@ async def call_perplexity(message, run_id, start):
         }, 500
 
 
-async def execute_provider(provider, message, run_id, start):
+async def execute_provider(
+    provider,
+    message,
+    run_id,
+    start,
+):
     if provider == OPENAI:
-        return await call_openai(message, run_id, start)
+        return await call_openai(
+            message,
+            run_id,
+            start,
+        )
 
     if provider == ANTHROPIC:
-        return await call_anthropic(message, run_id, start)
+        return await call_anthropic(
+            message,
+            run_id,
+            start,
+        )
 
     if provider == PERPLEXITY:
-        return await call_perplexity(message, run_id, start)
+        return await call_perplexity(
+            message,
+            run_id,
+            start,
+        )
 
     return {
         "provider": provider,
@@ -325,18 +431,31 @@ def root():
         "service": "OMENZ Backend",
         "status": "online",
         "message": "OMENZ Stack backend is running.",
-        "version": "0.3.2",
+        "version": BACKEND_VERSION,
         "router": "online",
+        "memory": "online",
         "route_endpoint": "/route",
+        "memory_health_endpoint": "/memory/health",
     }
 
 
 @app.get("/health")
 def health():
+    current_memory_health = memory_health()
+
     return {
         "status": "ok",
+        "version": BACKEND_VERSION,
         "router": "online",
+        "memory": current_memory_health["status"],
+        "memory_storage": current_memory_health["storage"],
+        "memory_persistent": current_memory_health["persistent"],
     }
+
+
+@app.get("/memory/health")
+def get_memory_health():
+    return memory_health()
 
 
 @app.get("/auth/patreon/callback")
@@ -352,15 +471,27 @@ async def patreon_callback(request: Request):
 @app.get("/test/env")
 def test_env():
     return {
-        "openai_key_loaded": bool(os.getenv("OPENAI_API_KEY")),
-        "anthropic_key_loaded": bool(os.getenv("ANTHROPIC_API_KEY")),
-        "perplexity_key_loaded": bool(os.getenv("PERPLEXITY_API_KEY")),
-        "openai_model": os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        "openai_key_loaded": bool(
+            os.getenv("OPENAI_API_KEY")
+        ),
+        "anthropic_key_loaded": bool(
+            os.getenv("ANTHROPIC_API_KEY")
+        ),
+        "perplexity_key_loaded": bool(
+            os.getenv("PERPLEXITY_API_KEY")
+        ),
+        "openai_model": os.getenv(
+            "OPENAI_MODEL",
+            "gpt-4o-mini",
+        ),
         "anthropic_model": os.getenv(
             "ANTHROPIC_MODEL",
             "claude-opus-4-6",
         ),
-        "perplexity_model": os.getenv("PERPLEXITY_MODEL", "sonar"),
+        "perplexity_model": os.getenv(
+            "PERPLEXITY_MODEL",
+            "sonar",
+        ),
     }
 
 
@@ -369,7 +500,9 @@ async def route_request(route_request: RouteRequest):
     start = time.time()
     run_id = event_id()
 
-    selected_provider = choose_available(route_request.task_type)
+    selected_provider = choose_available(
+        route_request.task_type
+    )
 
     if selected_provider is None:
         return JSONResponse(
@@ -391,9 +524,14 @@ async def route_request(route_request: RouteRequest):
 
     result["task_type"] = route_request.task_type
     result["router_selected"] = selected_provider
-    result["router_selected_name"] = provider_name(selected_provider)
+    result["router_selected_name"] = provider_name(
+        selected_provider
+    )
 
-    return JSONResponse(result, status_code=status_code)
+    return JSONResponse(
+        result,
+        status_code=status_code,
+    )
 
 
 @app.get("/test/openai")
@@ -407,7 +545,10 @@ async def test_openai():
         start=start,
     )
 
-    return JSONResponse(result, status_code=status_code)
+    return JSONResponse(
+        result,
+        status_code=status_code,
+    )
 
 
 @app.get("/test/anthropic")
@@ -421,7 +562,10 @@ async def test_anthropic():
         start=start,
     )
 
-    return JSONResponse(result, status_code=status_code)
+    return JSONResponse(
+        result,
+        status_code=status_code,
+    )
 
 
 @app.get("/test/perplexity")
@@ -435,7 +579,10 @@ async def test_perplexity():
         start=start,
     )
 
-    return JSONResponse(result, status_code=status_code)
+    return JSONResponse(
+        result,
+        status_code=status_code,
+    )
 
 
 @app.get("/test/providers")
@@ -450,7 +597,14 @@ async def test_all_providers():
             "method": "POST",
             "example": {
                 "task_type": "research",
-                "message": "What is the latest development in AI?",
+                "message": (
+                    "What is the latest development in AI?"
+                ),
             },
+        },
+        "memory": {
+            "health_endpoint": "/memory/health",
+            "storage": "in_process",
+            "persistent": False,
         },
     }
