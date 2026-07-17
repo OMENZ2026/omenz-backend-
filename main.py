@@ -1,13 +1,22 @@
 import os
 import time
 import uuid
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from memory import memory_health
+from memory import (
+    archive_memory,
+    create_memory,
+    get_memory,
+    list_memories,
+    memory_health,
+    revise_memory,
+    search_memory,
+)
 from router import (
     ANTHROPIC,
     OPENAI,
@@ -18,8 +27,8 @@ from router import (
 
 
 # ==========================================================
-# OMENZ BACKEND v0.3.3
-# Router + provider execution + memory health integration
+# OMENZ BACKEND v0.3.4
+# Router + provider execution + controlled memory operations
 # ==========================================================
 #
 # Preserved:
@@ -33,19 +42,24 @@ from router import (
 # - Provider validation endpoints
 # - run_id, latency, and token reporting
 #
-# Added:
-# - Memory module health reporting
-# - GET /memory/health
+# Memory endpoints:
+# - GET  /memory/health
+# - POST /memory/create
+# - GET  /memory/get/{memory_id}
+# - GET  /memory/list
+# - GET  /memory/search
+# - POST /memory/revise/{memory_id}
+# - POST /memory/archive/{memory_id}
 #
 # Important:
 # - Memory remains in-process and temporary.
-# - Memory records reset when the Cloud Run instance restarts.
-# - No memory create, revise, archive, or search API routes yet.
-# - No agents, dashboards, or autonomous memory promotion.
+# - Records reset whenever the Cloud Run instance restarts.
+# - No agents or autonomous memory promotion.
+# - No database or persistent storage yet.
 # ==========================================================
 
 
-BACKEND_VERSION = "0.3.3"
+BACKEND_VERSION = "0.3.4"
 
 app = FastAPI(
     title="OMENZ Backend",
@@ -57,8 +71,8 @@ class RouteRequest(BaseModel):
     task_type: str = Field(
         ...,
         description=(
-            "Task category such as chat, code, reasoning, "
-            "analysis, research, or search."
+            "Task category such as chat, code, execution, "
+            "reasoning, analysis, research, or search."
         ),
     )
     message: str = Field(
@@ -71,12 +85,116 @@ class RouteRequest(BaseModel):
     )
 
 
+class MemoryCreateRequest(BaseModel):
+    memory_type: str = Field(
+        ...,
+        description=(
+            "Allowed values: fact, preference, task_state, "
+            "system_event, or suggestion."
+        ),
+    )
+    content: str = Field(
+        ...,
+        min_length=1,
+        description="The information to store.",
+    )
+    source: str = Field(
+        ...,
+        min_length=1,
+        description="The source or provenance of the information.",
+    )
+    confidence: float = Field(
+        default=1.0,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score from 0.0 through 1.0.",
+    )
+    run_id: Optional[str] = Field(
+        default=None,
+        description="Optional request or workflow run identifier.",
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional structured metadata.",
+    )
+
+
+class MemoryReviseRequest(BaseModel):
+    content: str = Field(
+        ...,
+        min_length=1,
+        description="The corrected or revised content.",
+    )
+    source: str = Field(
+        ...,
+        min_length=1,
+        description="The source of the revision.",
+    )
+    confidence: Optional[float] = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description=(
+            "Optional revised confidence score. "
+            "The original score is retained when omitted."
+        ),
+    )
+    run_id: Optional[str] = Field(
+        default=None,
+        description="Optional request or workflow run identifier.",
+    )
+    metadata: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Optional metadata to merge into the revision.",
+    )
+
+
+class MemoryArchiveRequest(BaseModel):
+    reason: str = Field(
+        ...,
+        min_length=1,
+        description="Reason the active memory is being archived.",
+    )
+    run_id: Optional[str] = Field(
+        default=None,
+        description="Optional request or workflow run identifier.",
+    )
+
+
 def event_id():
     return str(uuid.uuid4())
 
 
 def now_ms(start):
     return round((time.time() - start) * 1000)
+
+
+def memory_error_response(
+    error: Exception,
+    default_status_code: int = 400,
+):
+    if isinstance(error, KeyError):
+        message = str(error).strip("'")
+        status_code = 404
+        error_type = "not_found"
+    elif isinstance(error, ValueError):
+        message = str(error)
+        status_code = default_status_code
+        error_type = "validation_error"
+    else:
+        message = str(error)
+        status_code = 500
+        error_type = "memory_exception"
+
+    return JSONResponse(
+        {
+            "status": "error",
+            "component": "memory",
+            "error_type": error_type,
+            "error": message,
+        },
+        status_code=status_code,
+    )
 
 
 def openai_usage(data):
@@ -435,7 +553,15 @@ def root():
         "router": "online",
         "memory": "online",
         "route_endpoint": "/route",
-        "memory_health_endpoint": "/memory/health",
+        "memory_endpoints": {
+            "health": "/memory/health",
+            "create": "/memory/create",
+            "get": "/memory/get/{memory_id}",
+            "list": "/memory/list",
+            "search": "/memory/search",
+            "revise": "/memory/revise/{memory_id}",
+            "archive": "/memory/archive/{memory_id}",
+        },
     }
 
 
@@ -456,6 +582,156 @@ def health():
 @app.get("/memory/health")
 def get_memory_health():
     return memory_health()
+
+
+@app.post("/memory/create")
+def create_memory_record(request: MemoryCreateRequest):
+    try:
+        record = create_memory(
+            memory_type=request.memory_type,
+            content=request.content,
+            source=request.source,
+            confidence=request.confidence,
+            run_id=request.run_id,
+            metadata=request.metadata,
+        )
+
+        return {
+            "status": "ok",
+            "operation": "memory_created",
+            "record": record,
+        }
+
+    except Exception as error:
+        return memory_error_response(error)
+
+
+@app.get("/memory/get/{memory_id}")
+def get_memory_record(
+    memory_id: str,
+    include_inactive: bool = False,
+):
+    try:
+        record = get_memory(
+            memory_id=memory_id,
+            include_inactive=include_inactive,
+        )
+
+        if record is None:
+            return JSONResponse(
+                {
+                    "status": "not_found",
+                    "operation": "memory_read",
+                    "memory_id": memory_id,
+                    "include_inactive": include_inactive,
+                },
+                status_code=404,
+            )
+
+        return {
+            "status": "ok",
+            "operation": "memory_read",
+            "record": record,
+        }
+
+    except Exception as error:
+        return memory_error_response(error)
+
+
+@app.get("/memory/list")
+def list_memory_records(
+    memory_type: Optional[str] = None,
+    status: Optional[str] = "active",
+    limit: int = 100,
+):
+    try:
+        records = list_memories(
+            memory_type=memory_type,
+            status=status,
+            limit=limit,
+        )
+
+        return {
+            "status": "ok",
+            "operation": "memory_listed",
+            "result_count": len(records),
+            "records": records,
+        }
+
+    except Exception as error:
+        return memory_error_response(error)
+
+
+@app.get("/memory/search")
+def search_memory_records(
+    query: str,
+    memory_type: Optional[str] = None,
+    limit: int = 20,
+):
+    try:
+        records = search_memory(
+            query=query,
+            memory_type=memory_type,
+            limit=limit,
+        )
+
+        return {
+            "status": "ok",
+            "operation": "memory_searched",
+            "query": query,
+            "result_count": len(records),
+            "records": records,
+        }
+
+    except Exception as error:
+        return memory_error_response(error)
+
+
+@app.post("/memory/revise/{memory_id}")
+def revise_memory_record(
+    memory_id: str,
+    request: MemoryReviseRequest,
+):
+    try:
+        record = revise_memory(
+            memory_id=memory_id,
+            content=request.content,
+            source=request.source,
+            confidence=request.confidence,
+            run_id=request.run_id,
+            metadata=request.metadata,
+        )
+
+        return {
+            "status": "ok",
+            "operation": "memory_revised",
+            "record": record,
+        }
+
+    except Exception as error:
+        return memory_error_response(error)
+
+
+@app.post("/memory/archive/{memory_id}")
+def archive_memory_record(
+    memory_id: str,
+    request: MemoryArchiveRequest,
+):
+    try:
+        record = archive_memory(
+            memory_id=memory_id,
+            reason=request.reason,
+            run_id=request.run_id,
+        )
+
+        return {
+            "status": "ok",
+            "operation": "memory_archived",
+            "record": record,
+        }
+
+    except Exception as error:
+        return memory_error_response(error)
 
 
 @app.get("/auth/patreon/callback")
@@ -588,7 +864,7 @@ async def test_perplexity():
 @app.get("/test/providers")
 async def test_all_providers():
     return {
-        "message": "Run these one at a time first:",
+        "message": "Run these provider checks one at a time:",
         "openai": "/test/openai",
         "anthropic": "/test/anthropic",
         "perplexity": "/test/perplexity",
@@ -603,7 +879,13 @@ async def test_all_providers():
             },
         },
         "memory": {
-            "health_endpoint": "/memory/health",
+            "health": "/memory/health",
+            "create": "/memory/create",
+            "get": "/memory/get/{memory_id}",
+            "list": "/memory/list",
+            "search": "/memory/search",
+            "revise": "/memory/revise/{memory_id}",
+            "archive": "/memory/archive/{memory_id}",
             "storage": "in_process",
             "persistent": False,
         },
