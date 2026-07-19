@@ -24,11 +24,12 @@ from router import (
     choose_available,
     provider_name,
 )
+from telemetry import telemetry_record
 
 
 # ==========================================================
-# OMENZ BACKEND v0.3.4
-# Router + provider execution + controlled memory operations
+# OMENZ BACKEND v0.3.5
+# Router + provider execution + memory + full telemetry
 # ==========================================================
 #
 # Preserved:
@@ -40,31 +41,36 @@ from router import (
 # - XITY / Perplexity execution
 # - Router selection
 # - Provider validation endpoints
+# - Controlled memory operations
 # - run_id, latency, and token reporting
 #
-# Memory endpoints:
-# - GET  /memory/health
-# - POST /memory/create
-# - GET  /memory/get/{memory_id}
-# - GET  /memory/list
-# - GET  /memory/search
-# - POST /memory/revise/{memory_id}
-# - POST /memory/archive/{memory_id}
+# Added:
+# - Structured router-decision telemetry
+# - Structured provider-call telemetry
+# - Provider success, failure, and exception events
+# - Memory-operation telemetry
+# - Shared run_id and correlation_id tracking
 #
 # Important:
 # - Memory remains in-process and temporary.
 # - Records reset whenever the Cloud Run instance restarts.
 # - No agents or autonomous memory promotion.
 # - No database or persistent storage yet.
+# - Prompt content is not emitted into telemetry.
 # ==========================================================
 
 
-BACKEND_VERSION = "0.3.4"
+BACKEND_VERSION = "0.3.5"
 
 app = FastAPI(
     title="OMENZ Backend",
     version=BACKEND_VERSION,
 )
+
+
+# ==========================================================
+# REQUEST CONTRACTS
+# ==========================================================
 
 
 class RouteRequest(BaseModel):
@@ -161,12 +167,21 @@ class MemoryArchiveRequest(BaseModel):
     )
 
 
-def event_id():
+# ==========================================================
+# SHARED HELPERS
+# ==========================================================
+
+
+def event_id() -> str:
     return str(uuid.uuid4())
 
 
-def now_ms(start):
+def now_ms(start: float) -> int:
     return round((time.time() - start) * 1000)
+
+
+def resolve_run_id(request_run_id: Optional[str] = None) -> str:
+    return request_run_id or event_id()
 
 
 def memory_error_response(
@@ -177,10 +192,12 @@ def memory_error_response(
         message = str(error).strip("'")
         status_code = 404
         error_type = "not_found"
+
     elif isinstance(error, ValueError):
         message = str(error)
         status_code = default_status_code
         error_type = "validation_error"
+
     else:
         message = str(error)
         status_code = 500
@@ -195,6 +212,38 @@ def memory_error_response(
         },
         status_code=status_code,
     )
+
+
+def emit_memory_telemetry(
+    *,
+    event_type: str,
+    status: str,
+    start: float,
+    run_id_value: str,
+    task_type: str,
+    error: Optional[str] = None,
+):
+    return telemetry_record(
+        provider="memory",
+        provider_name="OMENZ_MEMORY",
+        model="in_process",
+        status=status,
+        start=start,
+        tokens_in=0,
+        tokens_out=0,
+        cost_usd=0.0,
+        error=error,
+        task_type=task_type,
+        message=None,
+        event_type=event_type,
+        run_id_value=run_id_value,
+        correlation_id=run_id_value,
+    )
+
+
+# ==========================================================
+# PROVIDER USAGE HELPERS
+# ==========================================================
 
 
 def openai_usage(data):
@@ -233,11 +282,38 @@ def perplexity_usage(data):
     return tokens_in, tokens_out, total_tokens
 
 
-async def call_openai(message, run_id, start):
+# ==========================================================
+# PROVIDER EXECUTION
+# ==========================================================
+
+
+async def call_openai(
+    message,
+    run_id,
+    start,
+    task_type=None,
+):
     api_key = os.getenv("OPENAI_API_KEY")
     model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
     if not api_key:
+        telemetry_record(
+            provider=OPENAI,
+            provider_name=provider_name(OPENAI),
+            model=model,
+            status="missing_key",
+            start=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            error="OPENAI_API_KEY is not configured.",
+            task_type=task_type,
+            message=None,
+            event_type="provider_call",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": OPENAI,
             "provider_name": provider_name(OPENAI),
@@ -248,6 +324,7 @@ async def call_openai(message, run_id, start):
             "tokens_in": 0,
             "tokens_out": 0,
             "total_tokens": 0,
+            "cost_usd": 0.0,
         }, 500
 
     try:
@@ -278,14 +355,38 @@ async def call_openai(message, run_id, start):
         data = response.json()
         tokens_in, tokens_out, total_tokens = openai_usage(data)
 
+        status = (
+            "ok"
+            if response.status_code == 200
+            else "error"
+        )
+
+        error_text = None
+
+        if response.status_code != 200:
+            error_text = str(data)
+
+        telemetry_record(
+            provider=OPENAI,
+            provider_name=provider_name(OPENAI),
+            model=model,
+            status=status,
+            start=start,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=0.0,
+            error=error_text,
+            task_type=task_type,
+            message=None,
+            event_type="provider_call",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": OPENAI,
             "provider_name": provider_name(OPENAI),
-            "status": (
-                "ok"
-                if response.status_code == 200
-                else "error"
-            ),
+            "status": status,
             "status_code": response.status_code,
             "model": model,
             "run_id": run_id,
@@ -293,6 +394,7 @@ async def call_openai(message, run_id, start):
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "total_tokens": total_tokens,
+            "cost_usd": 0.0,
             "reply": (
                 data.get("choices", [{}])[0]
                 .get("message", {})
@@ -306,6 +408,23 @@ async def call_openai(message, run_id, start):
         }, response.status_code
 
     except Exception as error:
+        telemetry_record(
+            provider=OPENAI,
+            provider_name=provider_name(OPENAI),
+            model=model,
+            status="exception",
+            start=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            error=str(error),
+            task_type=task_type,
+            message=None,
+            event_type="provider_exception",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": OPENAI,
             "provider_name": provider_name(OPENAI),
@@ -317,10 +436,16 @@ async def call_openai(message, run_id, start):
             "tokens_in": 0,
             "tokens_out": 0,
             "total_tokens": 0,
+            "cost_usd": 0.0,
         }, 500
 
 
-async def call_anthropic(message, run_id, start):
+async def call_anthropic(
+    message,
+    run_id,
+    start,
+    task_type=None,
+):
     api_key = os.getenv("ANTHROPIC_API_KEY")
     model = os.getenv(
         "ANTHROPIC_MODEL",
@@ -328,6 +453,23 @@ async def call_anthropic(message, run_id, start):
     )
 
     if not api_key:
+        telemetry_record(
+            provider=ANTHROPIC,
+            provider_name=provider_name(ANTHROPIC),
+            model=model,
+            status="missing_key",
+            start=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            error="ANTHROPIC_API_KEY is not configured.",
+            task_type=task_type,
+            message=None,
+            event_type="provider_call",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": ANTHROPIC,
             "provider_name": provider_name(ANTHROPIC),
@@ -338,6 +480,7 @@ async def call_anthropic(message, run_id, start):
             "tokens_in": 0,
             "tokens_out": 0,
             "total_tokens": 0,
+            "cost_usd": 0.0,
         }, 500
 
     try:
@@ -375,14 +518,38 @@ async def call_anthropic(message, run_id, start):
             anthropic_usage(data)
         )
 
+        status = (
+            "ok"
+            if response.status_code == 200
+            else "error"
+        )
+
+        error_text = None
+
+        if response.status_code != 200:
+            error_text = str(data)
+
+        telemetry_record(
+            provider=ANTHROPIC,
+            provider_name=provider_name(ANTHROPIC),
+            model=model,
+            status=status,
+            start=start,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=0.0,
+            error=error_text,
+            task_type=task_type,
+            message=None,
+            event_type="provider_call",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": ANTHROPIC,
             "provider_name": provider_name(ANTHROPIC),
-            "status": (
-                "ok"
-                if response.status_code == 200
-                else "error"
-            ),
+            "status": status,
             "status_code": response.status_code,
             "model": model,
             "run_id": run_id,
@@ -390,6 +557,7 @@ async def call_anthropic(message, run_id, start):
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "total_tokens": total_tokens,
+            "cost_usd": 0.0,
             "reply": text,
             "raw": (
                 data
@@ -399,6 +567,23 @@ async def call_anthropic(message, run_id, start):
         }, response.status_code
 
     except Exception as error:
+        telemetry_record(
+            provider=ANTHROPIC,
+            provider_name=provider_name(ANTHROPIC),
+            model=model,
+            status="exception",
+            start=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            error=str(error),
+            task_type=task_type,
+            message=None,
+            event_type="provider_exception",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": ANTHROPIC,
             "provider_name": provider_name(ANTHROPIC),
@@ -410,14 +595,37 @@ async def call_anthropic(message, run_id, start):
             "tokens_in": 0,
             "tokens_out": 0,
             "total_tokens": 0,
+            "cost_usd": 0.0,
         }, 500
 
 
-async def call_perplexity(message, run_id, start):
+async def call_perplexity(
+    message,
+    run_id,
+    start,
+    task_type=None,
+):
     api_key = os.getenv("PERPLEXITY_API_KEY")
     model = os.getenv("PERPLEXITY_MODEL", "sonar")
 
     if not api_key:
+        telemetry_record(
+            provider=PERPLEXITY,
+            provider_name=provider_name(PERPLEXITY),
+            model=model,
+            status="missing_key",
+            start=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            error="PERPLEXITY_API_KEY is not configured.",
+            task_type=task_type,
+            message=None,
+            event_type="provider_call",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": PERPLEXITY,
             "provider_name": provider_name(PERPLEXITY),
@@ -428,6 +636,7 @@ async def call_perplexity(message, run_id, start):
             "tokens_in": 0,
             "tokens_out": 0,
             "total_tokens": 0,
+            "cost_usd": 0.0,
         }, 500
 
     try:
@@ -461,14 +670,38 @@ async def call_perplexity(message, run_id, start):
             perplexity_usage(data)
         )
 
+        status = (
+            "ok"
+            if response.status_code == 200
+            else "error"
+        )
+
+        error_text = None
+
+        if response.status_code != 200:
+            error_text = str(data)
+
+        telemetry_record(
+            provider=PERPLEXITY,
+            provider_name=provider_name(PERPLEXITY),
+            model=model,
+            status=status,
+            start=start,
+            tokens_in=tokens_in,
+            tokens_out=tokens_out,
+            cost_usd=0.0,
+            error=error_text,
+            task_type=task_type,
+            message=None,
+            event_type="provider_call",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": PERPLEXITY,
             "provider_name": provider_name(PERPLEXITY),
-            "status": (
-                "ok"
-                if response.status_code == 200
-                else "error"
-            ),
+            "status": status,
             "status_code": response.status_code,
             "model": model,
             "run_id": run_id,
@@ -476,6 +709,7 @@ async def call_perplexity(message, run_id, start):
             "tokens_in": tokens_in,
             "tokens_out": tokens_out,
             "total_tokens": total_tokens,
+            "cost_usd": 0.0,
             "reply": (
                 data.get("choices", [{}])[0]
                 .get("message", {})
@@ -489,6 +723,23 @@ async def call_perplexity(message, run_id, start):
         }, response.status_code
 
     except Exception as error:
+        telemetry_record(
+            provider=PERPLEXITY,
+            provider_name=provider_name(PERPLEXITY),
+            model=model,
+            status="exception",
+            start=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            error=str(error),
+            task_type=task_type,
+            message=None,
+            event_type="provider_exception",
+            run_id_value=run_id,
+            correlation_id=run_id,
+        )
+
         return {
             "provider": PERPLEXITY,
             "provider_name": provider_name(PERPLEXITY),
@@ -500,6 +751,7 @@ async def call_perplexity(message, run_id, start):
             "tokens_in": 0,
             "tokens_out": 0,
             "total_tokens": 0,
+            "cost_usd": 0.0,
         }, 500
 
 
@@ -508,27 +760,48 @@ async def execute_provider(
     message,
     run_id,
     start,
+    task_type=None,
 ):
     if provider == OPENAI:
         return await call_openai(
-            message,
-            run_id,
-            start,
+            message=message,
+            run_id=run_id,
+            start=start,
+            task_type=task_type,
         )
 
     if provider == ANTHROPIC:
         return await call_anthropic(
-            message,
-            run_id,
-            start,
+            message=message,
+            run_id=run_id,
+            start=start,
+            task_type=task_type,
         )
 
     if provider == PERPLEXITY:
         return await call_perplexity(
-            message,
-            run_id,
-            start,
+            message=message,
+            run_id=run_id,
+            start=start,
+            task_type=task_type,
         )
+
+    telemetry_record(
+        provider=str(provider),
+        provider_name=provider_name(provider),
+        model="unknown",
+        status="routing_error",
+        start=start,
+        tokens_in=0,
+        tokens_out=0,
+        cost_usd=0.0,
+        error="No available provider could be selected.",
+        task_type=task_type,
+        message=None,
+        event_type="routing_error",
+        run_id_value=run_id,
+        correlation_id=run_id,
+    )
 
     return {
         "provider": provider,
@@ -540,7 +813,13 @@ async def execute_provider(
         "tokens_in": 0,
         "tokens_out": 0,
         "total_tokens": 0,
+        "cost_usd": 0.0,
     }, 503
+
+
+# ==========================================================
+# ROOT AND HEALTH
+# ==========================================================
 
 
 @app.get("/")
@@ -552,6 +831,7 @@ def root():
         "version": BACKEND_VERSION,
         "router": "online",
         "memory": "online",
+        "telemetry": "online",
         "route_endpoint": "/route",
         "memory_endpoints": {
             "health": "/memory/health",
@@ -573,36 +853,92 @@ def health():
         "status": "ok",
         "version": BACKEND_VERSION,
         "router": "online",
+        "telemetry": "online",
         "memory": current_memory_health["status"],
         "memory_storage": current_memory_health["storage"],
         "memory_persistent": current_memory_health["persistent"],
     }
 
 
+# ==========================================================
+# MEMORY ENDPOINTS
+# ==========================================================
+
+
 @app.get("/memory/health")
 def get_memory_health():
-    return memory_health()
+    start = time.time()
+    current_run_id = event_id()
+
+    try:
+        result = memory_health()
+
+        emit_memory_telemetry(
+            event_type="memory_health",
+            status="ok",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_health",
+        )
+
+        return {
+            **result,
+            "run_id": current_run_id,
+        }
+
+    except Exception as error:
+        emit_memory_telemetry(
+            event_type="memory_health",
+            status="exception",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_health",
+            error=str(error),
+        )
+
+        return memory_error_response(error)
 
 
 @app.post("/memory/create")
 def create_memory_record(request: MemoryCreateRequest):
+    start = time.time()
+    current_run_id = resolve_run_id(request.run_id)
+
     try:
         record = create_memory(
             memory_type=request.memory_type,
             content=request.content,
             source=request.source,
             confidence=request.confidence,
-            run_id=request.run_id,
+            run_id=current_run_id,
             metadata=request.metadata,
+        )
+
+        emit_memory_telemetry(
+            event_type="memory_create",
+            status="ok",
+            start=start,
+            run_id_value=current_run_id,
+            task_type=request.memory_type,
         )
 
         return {
             "status": "ok",
             "operation": "memory_created",
+            "run_id": current_run_id,
             "record": record,
         }
 
     except Exception as error:
+        emit_memory_telemetry(
+            event_type="memory_create",
+            status="exception",
+            start=start,
+            run_id_value=current_run_id,
+            task_type=request.memory_type,
+            error=str(error),
+        )
+
         return memory_error_response(error)
 
 
@@ -611,6 +947,9 @@ def get_memory_record(
     memory_id: str,
     include_inactive: bool = False,
 ):
+    start = time.time()
+    current_run_id = event_id()
+
     try:
         record = get_memory(
             memory_id=memory_id,
@@ -618,23 +957,51 @@ def get_memory_record(
         )
 
         if record is None:
+            emit_memory_telemetry(
+                event_type="memory_get",
+                status="not_found",
+                start=start,
+                run_id_value=current_run_id,
+                task_type="memory_read",
+                error="Memory record was not found.",
+            )
+
             return JSONResponse(
                 {
                     "status": "not_found",
                     "operation": "memory_read",
                     "memory_id": memory_id,
                     "include_inactive": include_inactive,
+                    "run_id": current_run_id,
                 },
                 status_code=404,
             )
 
+        emit_memory_telemetry(
+            event_type="memory_get",
+            status="ok",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_read",
+        )
+
         return {
             "status": "ok",
             "operation": "memory_read",
+            "run_id": current_run_id,
             "record": record,
         }
 
     except Exception as error:
+        emit_memory_telemetry(
+            event_type="memory_get",
+            status="exception",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_read",
+            error=str(error),
+        )
+
         return memory_error_response(error)
 
 
@@ -644,6 +1011,9 @@ def list_memory_records(
     status: Optional[str] = "active",
     limit: int = 100,
 ):
+    start = time.time()
+    current_run_id = event_id()
+
     try:
         records = list_memories(
             memory_type=memory_type,
@@ -651,14 +1021,32 @@ def list_memory_records(
             limit=limit,
         )
 
+        emit_memory_telemetry(
+            event_type="memory_list",
+            status="ok",
+            start=start,
+            run_id_value=current_run_id,
+            task_type=memory_type or "all",
+        )
+
         return {
             "status": "ok",
             "operation": "memory_listed",
+            "run_id": current_run_id,
             "result_count": len(records),
             "records": records,
         }
 
     except Exception as error:
+        emit_memory_telemetry(
+            event_type="memory_list",
+            status="exception",
+            start=start,
+            run_id_value=current_run_id,
+            task_type=memory_type or "all",
+            error=str(error),
+        )
+
         return memory_error_response(error)
 
 
@@ -668,6 +1056,9 @@ def search_memory_records(
     memory_type: Optional[str] = None,
     limit: int = 20,
 ):
+    start = time.time()
+    current_run_id = event_id()
+
     try:
         records = search_memory(
             query=query,
@@ -675,15 +1066,33 @@ def search_memory_records(
             limit=limit,
         )
 
+        emit_memory_telemetry(
+            event_type="memory_search",
+            status="ok",
+            start=start,
+            run_id_value=current_run_id,
+            task_type=memory_type or "all",
+        )
+
         return {
             "status": "ok",
             "operation": "memory_searched",
+            "run_id": current_run_id,
             "query": query,
             "result_count": len(records),
             "records": records,
         }
 
     except Exception as error:
+        emit_memory_telemetry(
+            event_type="memory_search",
+            status="exception",
+            start=start,
+            run_id_value=current_run_id,
+            task_type=memory_type or "all",
+            error=str(error),
+        )
+
         return memory_error_response(error)
 
 
@@ -692,23 +1101,44 @@ def revise_memory_record(
     memory_id: str,
     request: MemoryReviseRequest,
 ):
+    start = time.time()
+    current_run_id = resolve_run_id(request.run_id)
+
     try:
         record = revise_memory(
             memory_id=memory_id,
             content=request.content,
             source=request.source,
             confidence=request.confidence,
-            run_id=request.run_id,
+            run_id=current_run_id,
             metadata=request.metadata,
+        )
+
+        emit_memory_telemetry(
+            event_type="memory_revise",
+            status="ok",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_revision",
         )
 
         return {
             "status": "ok",
             "operation": "memory_revised",
+            "run_id": current_run_id,
             "record": record,
         }
 
     except Exception as error:
+        emit_memory_telemetry(
+            event_type="memory_revise",
+            status="exception",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_revision",
+            error=str(error),
+        )
+
         return memory_error_response(error)
 
 
@@ -717,21 +1147,47 @@ def archive_memory_record(
     memory_id: str,
     request: MemoryArchiveRequest,
 ):
+    start = time.time()
+    current_run_id = resolve_run_id(request.run_id)
+
     try:
         record = archive_memory(
             memory_id=memory_id,
             reason=request.reason,
-            run_id=request.run_id,
+            run_id=current_run_id,
+        )
+
+        emit_memory_telemetry(
+            event_type="memory_archive",
+            status="ok",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_archive",
         )
 
         return {
             "status": "ok",
             "operation": "memory_archived",
+            "run_id": current_run_id,
             "record": record,
         }
 
     except Exception as error:
+        emit_memory_telemetry(
+            event_type="memory_archive",
+            status="exception",
+            start=start,
+            run_id_value=current_run_id,
+            task_type="memory_archive",
+            error=str(error),
+        )
+
         return memory_error_response(error)
+
+
+# ==========================================================
+# CALLBACK AND ENVIRONMENT ENDPOINTS
+# ==========================================================
 
 
 @app.get("/auth/patreon/callback")
@@ -771,31 +1227,71 @@ def test_env():
     }
 
 
+# ==========================================================
+# ROUTING ENDPOINT
+# ==========================================================
+
+
 @app.post("/route")
 async def route_request(route_request: RouteRequest):
     start = time.time()
-    run_id = event_id()
+    current_run_id = event_id()
 
     selected_provider = choose_available(
         route_request.task_type
     )
 
     if selected_provider is None:
+        telemetry_record(
+            provider="router",
+            provider_name="OMENZ_ROUTER",
+            model="router-v0.1",
+            status="no_provider_available",
+            start=start,
+            tokens_in=0,
+            tokens_out=0,
+            cost_usd=0.0,
+            error="No provider is currently available.",
+            task_type=route_request.task_type,
+            message=None,
+            event_type="router_decision",
+            run_id_value=current_run_id,
+            correlation_id=current_run_id,
+        )
+
         return JSONResponse(
             {
                 "task_type": route_request.task_type,
                 "status": "no_provider_available",
-                "run_id": run_id,
+                "run_id": current_run_id,
                 "latency_ms": now_ms(start),
             },
             status_code=503,
         )
 
+    telemetry_record(
+        provider=selected_provider,
+        provider_name=provider_name(selected_provider),
+        model="router-v0.1",
+        status="selected",
+        start=start,
+        tokens_in=0,
+        tokens_out=0,
+        cost_usd=0.0,
+        error=None,
+        task_type=route_request.task_type,
+        message=None,
+        event_type="router_decision",
+        run_id_value=current_run_id,
+        correlation_id=current_run_id,
+    )
+
     result, status_code = await execute_provider(
         provider=selected_provider,
         message=route_request.message,
-        run_id=run_id,
+        run_id=current_run_id,
         start=start,
+        task_type=route_request.task_type,
     )
 
     result["task_type"] = route_request.task_type
@@ -810,15 +1306,21 @@ async def route_request(route_request: RouteRequest):
     )
 
 
+# ==========================================================
+# PROVIDER TEST ENDPOINTS
+# ==========================================================
+
+
 @app.get("/test/openai")
 async def test_openai():
     start = time.time()
-    run_id = event_id()
+    current_run_id = event_id()
 
     result, status_code = await call_openai(
         message="Reply with: PENI online.",
-        run_id=run_id,
+        run_id=current_run_id,
         start=start,
+        task_type="provider_test",
     )
 
     return JSONResponse(
@@ -830,12 +1332,13 @@ async def test_openai():
 @app.get("/test/anthropic")
 async def test_anthropic():
     start = time.time()
-    run_id = event_id()
+    current_run_id = event_id()
 
     result, status_code = await call_anthropic(
         message="Reply with: AUDE online.",
-        run_id=run_id,
+        run_id=current_run_id,
         start=start,
+        task_type="provider_test",
     )
 
     return JSONResponse(
@@ -847,12 +1350,13 @@ async def test_anthropic():
 @app.get("/test/perplexity")
 async def test_perplexity():
     start = time.time()
-    run_id = event_id()
+    current_run_id = event_id()
 
     result, status_code = await call_perplexity(
         message="Reply with: XITY online.",
-        run_id=run_id,
+        run_id=current_run_id,
         start=start,
+        task_type="provider_test",
     )
 
     return JSONResponse(
@@ -877,6 +1381,16 @@ async def test_all_providers():
                     "What is the latest development in AI?"
                 ),
             },
+        },
+        "telemetry": {
+            "status": "online",
+            "destination": "Google Cloud Logging",
+            "structured": True,
+            "router_events": True,
+            "provider_events": True,
+            "memory_events": True,
+            "run_id_tracking": True,
+            "correlation_id_tracking": True,
         },
         "memory": {
             "health": "/memory/health",
